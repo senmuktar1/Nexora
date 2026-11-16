@@ -1,0 +1,45 @@
+{
+  "name": "nexora",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:migrate": "node scripts/db-migrate.mjs",
+    "admin:recovery": "node scripts/admin-recovery.mjs",
+    "test:e2e": "node e2e/wallet.mjs && node e2e/swap.mjs && node e2e/trading.mjs && node e2e/vouchers.mjs && node e2e/launch.mjs && node e2e/lending.mjs && node e2e/defindex.mjs && node e2e/rwa.mjs && node e2e/rwa-admin.mjs && node e2e/ui-audit.mjs"
+  },
+  "dependencies": {
+    "@blend-capital/blend-sdk": "4.0.0",
+    "@stellar/stellar-sdk": "^17.0.0",
+    "buffer": "^6.0.3",
+    "lucide-react": "^0.468.0",
+    "next": "^16.3.5",
+    "postgres": "3.4.9",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "server-only": "^0.0.1",
+    "smol-toml": "^1.9.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^16.3.5",
+    "fake-indexeddb": "^6.2.8",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "engines": {
+    "node": "22.x"
+  }
+}
