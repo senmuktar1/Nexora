@@ -1,0 +1,17 @@
+!.env.example
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+.idea
+.next
+.next/
+.vercel
+.vscode
+/build
+next-env.d.ts
+node_modules
+node_modules/
+npm-debug.log*
+/out
+/contracts/*/target
