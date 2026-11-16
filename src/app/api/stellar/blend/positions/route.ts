@@ -1,0 +1,174 @@
+import { ensureVerifiedMainnetRpc, verifiedMainnetRpcUrl } from "@/lib/server/soroban";
+import { UNAVAILABLE } from "@/lib/server/errors";
+import { safeError } from "@/lib/server/errors";
+import { NextRequest, NextResponse } from "next/server";
+import { Networks, rpc } from "@stellar/stellar-sdk";
+import { PoolMetadata, PoolOracle, PoolV2, PositionsEstimate, TokenMetadata } from "@blend-capital/blend-sdk";
+
+export const dynamic = "force-dynamic";
+// Soroban reads + simulation can exceed short serverless defaults; hosts that honour this get 30 s.
+export const maxDuration = 30;
+export const revalidate = 0;
+
+const CONFIG = {
+  testnet: {
+    rpc: "https://soroban-testnet.stellar.org",
+    passphrase: Networks.TESTNET,
+    backstops: ["CBDVWXT433PRVTUNM56C3JREF3HIZHRBA64NB2C3B2UNCKIS65ZYCLZA", "CBGSFY6NR5TSCQJH5EGVMCFTHLZBCAO7YPIW426WSD46V3TESPA3U6DI"],
+    pools: [{ id: "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF", label: "Blend Testnet V2" }]
+  },
+  mainnet: {
+    get rpc() { return verifiedMainnetRpcUrl(); },
+    passphrase: Networks.PUBLIC,
+    backstops: ["CAQQR5SWBXKIGZKPBZDH3KM5GQ5GUTPKB7JAFCINLZBC5WXPJKRG3IM7", "CCS4AZ5ORM6VLLPJTJUFRNXWBMHOO3L5WHHRPL2ZMILE35ZDMQFHOQMJ"],
+    pools: [
+      { id: "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD", label: "Fixed V2" },
+      { id: "CCCCIQSDILITHMM7PBSLVDT5MISSY7R26MNZXCX4H7J5JQ5FPIYOGYFS", label: "YieldBlox V2" },
+      { id: "CBAKAZUEJBAFA2DCGBRS2WKJT3FNIMJBHTFL76AY7XMAVEINQNNIQWAO", label: "Fixed V2.1" }
+    ]
+  }
+} as const;
+
+const ALLOWED_POOL_HASHES = new Set([
+  "a41fc53d6753b6c04eb15b021c55052366a4c8e0e21bc72700f461264ec1350e",
+  "6a7c67449f6bad0d5f641cfbdf03f430ec718faa85107ecb0b97df93410d1c43"
+]);
+
+function finite(value: number): number | null {
+  return Number.isFinite(value) ? value : null;
+}
+
+async function readPoolPosition(network: "testnet" | "mainnet", address: string, candidate: {id:string;label:string}, rpcLedger:number) {
+  const config = CONFIG[network];
+  const sdkNetwork = { rpc: config.rpc, passphrase: config.passphrase };
+  const metadata = await PoolMetadata.load(sdkNetwork, candidate.id);
+  if (!ALLOWED_POOL_HASHES.has(metadata.wasmHash) || !config.backstops.includes(metadata.backstop as never)) {
+    throw new Error("Pool contract identity did not match the official Blend deployment manifest.");
+  }
+
+  const pool = await PoolV2.loadWithMetadata(sdkNetwork, candidate.id, metadata);
+  const user = await pool.loadUser(address);
+  const positions = user.positions;
+  const hasPosition = positions.supply.size > 0 || positions.collateral.size > 0 || positions.liabilities.size > 0;
+  if (!hasPosition) {
+    return {
+      id: candidate.id,
+      label: candidate.label,
+      name: metadata.name,
+      version: metadata.backstop === config.backstops[1] ? "V2.1" : "V2",
+      hasPosition: false,
+      positions: [],
+      estimate: null,
+      oracleLedger: null
+    };
+  }
+
+  // A wallet estimate only needs prices for assets actually present in its position.
+  // Loading every pool feed can fail because of an unrelated reserve with no oracle price.
+  const requiredReserveIds = new Set([
+    ...positions.supply.keys(),
+    ...positions.collateral.keys(),
+    ...positions.liabilities.keys()
+  ]);
+  const requiredAssets = Array.from(pool.reserves.values())
+    .filter(reserve => requiredReserveIds.has(reserve.config.index))
+    .map(reserve => reserve.assetId);
+  const oracle = await PoolOracle.load(sdkNetwork, metadata.oracle, requiredAssets);
+  const rows = await Promise.all(Array.from(pool.reserves.values()).map(async reserve => {
+    const supplyRaw = positions.supply.get(reserve.config.index);
+    const collateralRaw = positions.collateral.get(reserve.config.index);
+    const liabilityRaw = positions.liabilities.get(reserve.config.index);
+    const supply = supplyRaw === undefined ? 0 : reserve.toAssetFromBTokenFloat(supplyRaw);
+    const collateral = collateralRaw === undefined ? 0 : reserve.toAssetFromBTokenFloat(collateralRaw);
+    const borrowed = liabilityRaw === undefined ? 0 : reserve.toAssetFromDTokenFloat(liabilityRaw);
+    if (supply === 0 && collateral === 0 && borrowed === 0) return null;
+
+    let token: {symbol:string;name:string}|null = null;
+    try {
+      const data = await TokenMetadata.load(sdkNetwork, reserve.assetId);
+      token = { symbol: data.symbol, name: data.name };
+    } catch {
+      // Preserve contract identity when token metadata is unavailable.
+    }
+    const oraclePrice = oracle.getPriceFloat(reserve.assetId);
+    return {
+      assetContract: reserve.assetId,
+      symbol: token?.symbol ?? null,
+      name: token?.name ?? null,
+      supply: finite(supply),
+      collateral: finite(collateral),
+      borrowed: finite(borrowed),
+      effectiveCollateral: collateralRaw === undefined ? 0 : finite(reserve.toEffectiveAssetFromBTokenFloat(collateralRaw)),
+      effectiveLiability: liabilityRaw === undefined ? 0 : finite(reserve.toEffectiveAssetFromDTokenFloat(liabilityRaw)),
+      oraclePrice: oraclePrice === undefined ? null : finite(oraclePrice),
+      oracleValue: oraclePrice === undefined ? null : finite((supply + collateral - borrowed) * oraclePrice),
+      latestLedger: reserve.latestLedger
+    };
+  }));
+
+  const estimate = PositionsEstimate.build(pool, oracle, positions);
+  const latestReserveLedger = Math.max(...Array.from(pool.reserves.values()).map(reserve=>reserve.latestLedger),0);
+  const oracleLedgerAge = Math.max(0,rpcLedger-oracle.latestLedger);
+  return {
+    id: candidate.id,
+    label: candidate.label,
+    name: metadata.name,
+    version: metadata.backstop === config.backstops[1] ? "V2.1" : "V2",
+    hasPosition: true,
+    positions: rows.filter((row): row is NonNullable<typeof row> => row !== null),
+    estimate: {
+      totalBorrowed: finite(estimate.totalBorrowed),
+      totalSupplied: finite(estimate.totalSupplied),
+      totalEffectiveLiabilities: finite(estimate.totalEffectiveLiabilities),
+      totalEffectiveCollateral: finite(estimate.totalEffectiveCollateral),
+      borrowCap: finite(estimate.borrowCap),
+      borrowLimit: finite(estimate.borrowLimit),
+      netApy: finite(estimate.netApy),
+      supplyApy: finite(estimate.supplyApy),
+      borrowApy: finite(estimate.borrowApy)
+    },
+    oracleLedger: oracle.latestLedger,
+    oracleLedgerAge,
+    latestReserveLedger,
+    rpcLedger,
+    oracleBehindRpcHead: oracle.latestLedger < rpcLedger,
+    oracleBehindReserveState: oracle.latestLedger < latestReserveLedger
+  };
+}
+
+export async function GET(request: NextRequest) {
+  const network = request.nextUrl.searchParams.get("network") ?? "mainnet";
+  const address = (request.nextUrl.searchParams.get("address") ?? "").trim();
+  if (network !== "mainnet") {
+    return NextResponse.json({ error: "Unsupported Stellar network." }, { status: 400 });
+  }
+  if (!/^G[A-Z2-7]{55}$/.test(address)) {
+    return NextResponse.json({ error: "A valid public Stellar G-address is required." }, { status: 400 });
+  }
+
+  if (network !== "mainnet" || !(await ensureVerifiedMainnetRpc())) {
+    return NextResponse.json({ error: UNAVAILABLE, status: "soroban_unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
+  }
+
+  const config = CONFIG[network];
+  try {
+    const server = new rpc.Server(config.rpc);
+    const ledger = await server.getLatestLedger();
+    const settled = await Promise.allSettled(config.pools.map(candidate => readPoolPosition(network, address, candidate, ledger.sequence)));
+    const pools = settled.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
+    const unavailable = settled.flatMap((result, index) => result.status === "rejected"
+      ? [{ id: config.pools[index].id, label: config.pools[index].label, reason: safeError(result.reason, "stellar/blend/positions:pool") }]
+      : []);
+    return NextResponse.json({
+      network,
+      address,
+      source: "Blend Soroban position ledger entries and official SDK estimates",
+      ledger: ledger.sequence,
+      retrievedAt: new Date().toISOString(),
+      pools,
+      unavailable
+    }, { headers: { "Cache-Control": "no-store" } });
+  } catch (error) {
+    return NextResponse.json({ error: safeError(error, "stellar/blend/positions") }, { status: 502, headers: { "Cache-Control": "no-store" } });
+  }
+}
